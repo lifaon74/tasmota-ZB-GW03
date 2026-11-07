@@ -1,0 +1,217 @@
+# Pipeline — builds the ZB-GW03 firmware (EN) from the latest stable Upstream
+# release of arendst/Tasmota plus the Override files maintained under tasmota/,
+# and upserts the result as a GitHub Release carrying the mirrored tag.
+#
+# Triggers:
+#   - daily cron — rebuild the latest stable Upstream release (resolved
+#     inside tasmota/build.sh, which is also what a local session runs)
+#   - workflow_dispatch — manual rebuild
+#   - push to main touching tasmota/** — includes recipe fixes by an agent
+#     working a diagnostic issue
+# A pull_request touching tasmota/** runs the build only: no Release and no
+# diagnostic issue. Publishing happens on main; recipe changes land through
+# PRs (main is ruleset-protected) and the merge push triggers the Pipeline.
+#
+# Parity: CI and local agent sessions run the SAME script — tasmota/build.sh
+# (native Linux, no Docker). Nothing here duplicates build steps.
+#
+# Release semantics: the tag mirrors the Upstream release name; the Release is
+# created if absent, binaries replaced if present (upsert).
+#
+# Failure path: the run goes red, no Release is touched, and a
+# self-documenting diagnostic issue (failing steps, changelog delta since the
+# last good build, log tail, and agent pickup instructions) is opened on main
+# or updated in place. A later successful build auto-closes open diagnostic
+# issues.
+
+name: Pipeline
+
+on:
+  schedule:
+    - cron: "37 3 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["tasmota/**"]
+  pull_request:
+    paths: ["tasmota/**"]
+
+permissions:
+  contents: write # mirrored-tag Release upsert
+  issues: write   # diagnostic issues: create / update / close
+
+concurrency:
+  group: pipeline
+  cancel-in-progress: false # serialize runs; each run is idempotent
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache toolchains (PlatformIO packages + uv)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/uv
+            ~/.local/share/uv
+          key: pio-uv-pioarduino-6.2.0-${{ hashFiles('tasmota/platformio_override.ini') }}
+          restore-keys: |
+            pio-uv-
+
+      - id: build
+        name: Build firmware via tasmota/build.sh (the parity script)
+        run: |
+          set -euo pipefail
+          tasmota/build.sh 2>&1 | tee build_log.txt
+          TAG="$(sed -n 's/^==> Upstream release: //p' build_log.txt | head -n1)"
+          if [ -z "$TAG" ]; then
+            echo "Could not parse the resolved Upstream tag from build output" >&2
+            exit 1
+          fi
+          echo "upstream_tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Upsert mirrored-tag Release
+        if: success() && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.build.outputs.upstream_tag }}"
+          UPSTREAM_SHA="$(git -C ".upstream/Tasmota-$TAG" rev-parse HEAD)"
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          SHA256="$(cd build && sha256sum *.bin)"
+
+          NOTES="$(cat <<'EOF'
+          Firmware for the ZB-GW03 (EN) built from Upstream `arendst/Tasmota` tag `@@TAG@@` (commit `@@UPSTREAM_SHA@@`, shipped exactly as released) with the Override files maintained under `tasmota/` in this repo.
+
+          - Pipeline run: @@RUN_URL@@ (this repo at `@@REPO_SHA@@`)
+          - Images: `tasmota32-ZB-GW03-EN.bin` (OTA image, flashed over the air via Tasmota's upgrade flow) and `tasmota32-ZB-GW03-EN.factory.bin` (factory image, flashed over serial on first install)
+          - `sha256sum`:
+          ```
+          @@SHA256@@
+          ```
+          EOF
+          )"
+          NOTES="${NOTES//@@TAG@@/$TAG}"
+          NOTES="${NOTES//@@UPSTREAM_SHA@@/$UPSTREAM_SHA}"
+          NOTES="${NOTES//@@RUN_URL@@/$RUN_URL}"
+          NOTES="${NOTES//@@REPO_SHA@@/$GITHUB_SHA}"
+          NOTES="${NOTES//@@SHA256@@/$SHA256}"
+
+          TITLE="ZB-GW03 $TAG (EN)"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" build/*.bin --clobber
+            gh release edit "$TAG" --title "$TITLE" --notes-file "$NOTES"
+            echo "Release $TAG: binaries replaced (upsert)."
+          else
+            gh release create "$TAG" build/*.bin --target "$GITHUB_SHA" \
+              --title "$TITLE" --notes-file "$NOTES"
+            echo "Release $TAG: created, tag pointing at $GITHUB_SHA."
+          fi
+
+      - name: Close resolved diagnostic issues
+        if: success() && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          TAG="${{ steps.build.outputs.upstream_tag }}"
+          OPEN="$(gh issue list --label build-failure --state open --json number --jq 'map(.number) | join(" ")' || true)"
+          for ISSUE_NO in $OPEN; do
+            gh issue close "$ISSUE_NO" --comment "Resolved: Pipeline run [$GITHUB_RUN_ID]($RUN_URL) built and published cleanly (Upstream release \`$TAG\`). Closing as superseded."
+          done
+
+      - name: Open or update the diagnostic issue
+        if: failure() && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          TAG="$(sed -n 's/^==> Upstream release: //p' build_log.txt 2>/dev/null | head -n1)"
+          TAG_DISPLAY="${TAG:-_not resolved_}"
+          if [ -n "$TAG" ]; then
+            TITLE="Pipeline build failed: $TAG"
+          else
+            TITLE="Pipeline build failed: Upstream tag unresolved"
+          fi
+
+          gh label create build-failure --color D95525 \
+            --description "A Pipeline firmware build failed; needs a recipe fix" \
+            >/dev/null 2>&1 || true
+
+          FAILED_STEPS="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" \
+            --jq '[.jobs[] | .steps[] | select(.conclusion == "failure") | .name] | join("\n")')"
+
+          # Previous good build: the latest mirrored-tag Release in this repo
+          # (stable vX.Y.Z only), excluding the tag this run was attempting.
+          PREV="$(gh release list --limit 30 --json tagName,createdAt,isPrerelease,isDraft 2>/dev/null \
+            --jq '[.[] | select(.isPrerelease | not) | select(.isDraft | not) | select((.tagName | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")) and .tagName != "'"$TAG"'")] | sort_by(.createdAt) | reverse | .[0].tagName // empty')"
+
+          # Changelog delta since the last good build.
+          if [ -n "$TAG" ] && [ -n "$PREV" ] && [ "$PREV" != "$TAG" ]; then
+            N_COMMITS="$(gh api "repos/arendst/Tasmota/compare/$PREV...$TAG" --jq .total_commits)"
+            CMP_URL="$(gh api "repos/arendst/Tasmota/compare/$PREV...$TAG" --jq .html_url)"
+            SUBJ="$(gh api "repos/arendst/Tasmota/compare/$PREV...$TAG" \
+              --jq '.commits[:40][] | "- `" + .sha[0:7] + "` " + (.commit.message | split("\n")[0])')"
+            DELTA="**$N_COMMITS** Upstream commits since \`$PREV\` — compare: $CMP_URL
+          $SUBJ"
+          elif [ -n "$PREV" ] && [ "$PREV" = "$TAG" ]; then
+            DELTA="None — the previous good build (\`$PREV\`) was for the SAME Upstream release. Suspect a repo-side change (Override files, \`tasmota/build.sh\`, toolchain caches) or a flaky runner."
+          elif [ -z "$PREV" ]; then
+            DELTA="No previous mirrored-tag Release exists in this repo, so there is no baseline (first build)."
+          else
+            DELTA="The Upstream tag could not be resolved; see the run log."
+          fi
+
+          if [ -f build_log.txt ]; then
+            LOG_TAIL="$(tail -n 80 build_log.txt)"
+          else
+            LOG_TAIL="build_log.txt was not created — the failure occurred before the build step (see the failing steps above)."
+          fi
+
+          ISSUE_NO="$(gh issue list --label build-failure --state open --json number,title \
+            --jq '[.[] | select(.title | startswith("Pipeline build failed")) | .number] | .[0] // empty')"
+
+          BODY="$(cat <<'EOF'
+          ## Pipeline build failed
+
+          The [Pipeline run](@@RUN_URL@@) failed before it could publish the mirrored-tag Release. Upstream release attempted: `@@TAG_DISPLAY@@`.
+
+          **Failing step(s):**
+
+          @@FAILED_STEPS@@
+
+          ## Changelog delta since the last good build
+
+          @@DELTA@@
+
+          ## Log tail (`build_log.txt`, last 80 lines — full log in the run)
+
+          ```
+          @@LOG_TAIL@@
+          ```
+
+          ## Picking this up (agents)
+
+          1. Vocabulary first: `GLOSSARY.md` (Upstream release, Override files, Mirrored tag, Pipeline, OTA image, Factory image).
+          2. Reproduce locally, same steps as CI: `UPSTREAM_TAG=@@TAG_DISPLAY@@ tasmota/build.sh` (native Linux, no Docker). `tasmota/build.sh` is the single source of build steps — local == CI by construction. Without `UPSTREAM_TAG` it resolves the same latest stable Upstream release.
+          3. Most probable causes: items in the changelog delta above touching anything the Override files or `tasmota/build.sh` depend on (env/hardware/callback renames, toolchain changes). The Override files are `tasmota/user_config_override.h` and `tasmota/platformio_override.ini`; the recipe logic is `tasmota/build.sh`.
+          4. Fix: edit those files under `tasmota/` on a feature branch and open a PR against `main` (the repo allows a maintainer to merge their own PR). The merge push to `main` touching `tasmota/**` re-triggers the Pipeline; a successful build publishes the Release and auto-closes this issue.
+          EOF
+          )"
+
+          BODY="${BODY//@@RUN_URL@@/$RUN_URL}"
+          BODY="${BODY//@@TAG_DISPLAY@@/$TAG_DISPLAY}"
+          BODY="${BODY//@@FAILED_STEPS@@/$FAILED_STEPS}"
+          BODY="${BODY//@@DELTA@@/$DELTA}"
+          BODY="${BODY//@@LOG_TAIL@@/$LOG_TAIL}"
+
+          if [ -n "$ISSUE_NO" ]; then
+            gh issue comment "$ISSUE_NO" --body "$BODY"
+            echo "Updated diagnostic issue #$ISSUE_NO."
+          else
+            gh issue create --title "$TITLE" --body "$BODY" --label build-failure
+          fi
