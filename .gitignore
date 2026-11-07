@@ -1,0 +1,4 @@
+# build.sh locals: Upstream checkout, toolchain venv, firmware artifacts
+/.upstream/
+/.venv/
+/build/
