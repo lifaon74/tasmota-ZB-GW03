@@ -30,7 +30,7 @@ OUT="${OUT:-$REPO_ROOT/build}"
 # --- resolve the latest stable Upstream release ("last" vX.Y.Z tag) -------------
 if [ -z "${UPSTREAM_TAG:-}" ]; then
   UPSTREAM_TAG="$(git ls-remote --tags --refs "$UPSTREAM_URL" \
-    | sed -En 's|.*/refs/tags/(v[0-9]+\.[0-9]+\.[0-9]+)$|\1|p' \
+    | sed -En 's|.*refs/tags/(v[0-9]+\.[0-9]+\.[0-9]+)$|\1|p' \
     | sort -V | tail -n1)"
 fi
 echo "==> Upstream release: $UPSTREAM_TAG"
