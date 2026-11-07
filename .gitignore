@@ -1,0 +1,6 @@
+# build.sh locals: Upstream checkout, toolchain venv, firmware artifacts, and
+# the workflow-style build log an agent session may emit for parity
+/.upstream/
+/.venv/
+/build/
+/build_log.txt
