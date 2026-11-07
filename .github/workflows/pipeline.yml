@@ -12,8 +12,9 @@
 # diagnostic issue. Publishing happens on main; recipe changes land through
 # PRs (main is ruleset-protected) and the merge push triggers the Pipeline.
 #
-# Parity: CI and local agent sessions run the SAME script — tasmota/build.sh
-# (native Linux, no Docker). Nothing here duplicates build steps.
+# Parity: this Pipeline and local agent sessions run the SAME script —
+# tasmota/build.sh (native Linux, no Docker). Nothing here duplicates build
+# steps.
 #
 # Release semantics: the tag mirrors the Upstream release name; the Release is
 # created if absent, binaries replaced if present (upsert).
@@ -51,6 +52,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - uses: actions/checkout@v4
 
@@ -82,8 +84,7 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${{ steps.build.outputs.upstream_tag }}"
-          UPSTREAM_SHA="$(git -C ".upstream/Tasmota-$TAG" rev-parse HEAD)"
-          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          UPSTREAM_SHA="$(sed -n 's/^==> Upstream release sha: //p' build_log.txt | head -n1)"
           SHA256="$(cd build && sha256sum *.bin)"
 
           NOTES="$(cat <<'EOF'
@@ -118,7 +119,6 @@ jobs:
         if: success() && github.ref == 'refs/heads/main'
         run: |
           set -euo pipefail
-          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           TAG="${{ steps.build.outputs.upstream_tag }}"
           OPEN="$(gh issue list --label build-failure --state open --json number --jq 'map(.number) | join(" ")' || true)"
           for ISSUE_NO in $OPEN; do
@@ -129,7 +129,9 @@ jobs:
         if: failure() && github.ref == 'refs/heads/main'
         run: |
           set -euo pipefail
-          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          # Re-derive the tag from build_log.txt: GITHUB_OUTPUT stays unwritten
+          # when the build step dies mid-run, but build.sh always prints its
+          # resolution line before any build work can fail.
           TAG="$(sed -n 's/^==> Upstream release: //p' build_log.txt 2>/dev/null | head -n1)"
           TAG_DISPLAY="${TAG:-_not resolved_}"
           if [ -n "$TAG" ]; then
@@ -172,8 +174,10 @@ jobs:
             LOG_TAIL="build_log.txt was not created — the failure occurred before the build step (see the failing steps above)."
           fi
 
+          # Update the rolling diagnostic issue for the SAME tag only; a new
+          # failing tag opens its own issue (stale ones close on next success).
           ISSUE_NO="$(gh issue list --label build-failure --state open --json number,title \
-            --jq '[.[] | select(.title | startswith("Pipeline build failed")) | .number] | .[0] // empty')"
+            --jq '[.[] | select(.title == "'"$TITLE"'") | .number] | .[0] // empty')"
 
           BODY="$(cat <<'EOF'
           ## Pipeline build failed

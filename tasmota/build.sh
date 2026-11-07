@@ -62,11 +62,15 @@ cp -v "$REPO_ROOT/tasmota/user_config_override.h" "$SRC/tasmota/user_config_over
 cp -v "$REPO_ROOT/tasmota/platformio_override.ini" "$SRC/platformio_override.ini"
 
 # --- release footer ---------------------------------------------------------------
-# Stamp the tag commit sha into tasmota_version.h (Upstream CI fills it via sed),
-# then apply Upstream CI's sed verbatim so the footer reads "<tag> release-<sha>".
+# Reproduce Upstream's master-workflow sed VERBATIM (Tasmota_build_master.yml:
+# s/TASMOTA_SHA_SHORT/TASMOTA_SHA_SHORT release-/g); the define line then reads
+# "#define TASMOTA_SHA_SHORT release-". The proven build ships the "release-"
+# footer marker in-binary (verified, issue #2). No sha fill: the empty-quoted
+# fill pattern suggested for exact parity never matches the official tag tree
+# (the define ships with no quoted default) and was dropped as a no-op.
 UPSTREAM_SHA="$(git -C "$SRC" rev-parse --short=7 HEAD)"
+echo "==> Upstream release sha: $UPSTREAM_SHA"
 VERSION_H="$SRC/tasmota/include/tasmota_version.h"
-sed -i "s/TASMOTA_SHA_SHORT \"\"/TASMOTA_SHA_SHORT \"${UPSTREAM_SHA}\"/" "$VERSION_H"
 sed -i -e "s/TASMOTA_SHA_SHORT/TASMOTA_SHA_SHORT release-/g" "$VERSION_H"
 grep -n TASMOTA_SHA_SHORT "$VERSION_H" || true
 
