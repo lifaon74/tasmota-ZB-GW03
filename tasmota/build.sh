@@ -14,6 +14,8 @@
 # Usage:
 #   tasmota/build.sh                       # latest stable Upstream release
 #   UPSTREAM_TAG=v16.0.0 tasmota/build.sh  # a specific tag
+#   RESOLVE_ONLY=1 tasmota/build.sh        # print the resolved tag and exit (no
+#                                          # toolchain, no clone — CI skip gate)
 #
 # Outputs: ./build/*.bin + sha256
 #
@@ -34,6 +36,10 @@ if [ -z "${UPSTREAM_TAG:-}" ]; then
     | sort -V | tail -n1)"
 fi
 echo "==> Upstream release: $UPSTREAM_TAG"
+if [ "${RESOLVE_ONLY:-}" = 1 ]; then
+  echo "==> Stopping after resolution (RESOLVE_ONLY=1)"
+  exit 0
+fi
 
 # --- toolchain ------------------------------------------------------------------
 if ! command -v uv >/dev/null 2>&1; then

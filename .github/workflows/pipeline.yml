@@ -3,9 +3,10 @@
 # and upserts the result as a GitHub Release carrying the mirrored tag.
 #
 # Triggers:
-#   - daily cron — rebuild the latest stable Upstream release (resolved
-#     inside tasmota/build.sh, which is also what a local session runs)
-#   - workflow_dispatch — manual rebuild
+#   - daily cron — resolve the latest stable Upstream release (inside
+#     tasmota/build.sh, which is also what a local session runs) and build
+#     only if that (release, recipe) pair is not already published
+#   - workflow_dispatch — manual run; the `force` input rebuilds regardless
 #   - push to main touching tasmota/** — includes recipe fixes by an agent
 #     working a diagnostic issue
 # A pull_request touching tasmota/** runs the build only: no Release and no
@@ -17,7 +18,10 @@
 # steps.
 #
 # Release semantics: the tag mirrors the Upstream release name; the Release is
-# created if absent, binaries replaced if present (upsert).
+# created if absent, binaries replaced if present (upsert). The skip-if-
+# unchanged gate keys on a "Recipe digest" line in the Release notes (hash of
+# tasmota/**): no Upstream change and no recipe change → nothing rebuilds, and
+# the published binaries (and their digests) stop rotating daily.
 #
 # Failure path: the run goes red, no Release is touched, and a
 # self-documenting diagnostic issue (failing steps, changelog delta since the
@@ -31,6 +35,12 @@ on:
   schedule:
     - cron: "37 3 * * *"
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Build even if this Upstream release + recipe pair is already published"
+        required: false
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths: ["tasmota/**"]
@@ -56,7 +66,43 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - id: decide
+        name: Skip gate — (Upstream release, recipe digest) already published?
+        if: github.ref == 'refs/heads/main'
+        env:
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          # The resolver stays in build.sh (the single source): RESOLVE_ONLY
+          # prints just the tag, before any toolchain or clone work.
+          TAG="$(RESOLVE_ONLY=1 tasmota/build.sh 2>/dev/null | sed -n 's/^==> Upstream release: //p' | head -n1)"
+          [ -n "$TAG" ] || { echo "build.sh (RESOLVE_ONLY) resolved no Upstream tag" >&2; exit 1; }
+          RECIPE_DIGEST="$(find tasmota -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+          if [ "$FORCE" = "true" ]; then
+            SKIP=false
+            echo "Forced rebuild requested (workflow_dispatch input: force)."
+          else
+            PUBLISHED="$(gh release view "$TAG" --json body --jq .body 2>/dev/null || true)"
+            PUBLISHED_DIGEST="$(sed -nE 's/^- Recipe digest: ([0-9a-f]{64}).*/\1/p' <<<"$PUBLISHED" | head -n1)"
+            if [ "$PUBLISHED_DIGEST" = "$RECIPE_DIGEST" ]; then
+              SKIP=true
+              echo "Upstream release $TAG is already published with recipe digest ${RECIPE_DIGEST:0:12}… — skipping the build."
+              {
+                echo "## Pipeline: skipped"
+                echo ""
+                echo "Upstream release \`$TAG\` is already published with recipe digest \`$RECIPE_DIGEST\`."
+                echo ""
+                echo "Rebuild anyway with workflow_dispatch and the \`force\` input."
+              } >> "$GITHUB_STEP_SUMMARY"
+            else
+              SKIP=false
+              echo "Building $TAG: published digest is ${PUBLISHED_DIGEST:-<none>}; current is ${RECIPE_DIGEST:0:12}…"
+            fi
+          fi
+          { echo "skip=$SKIP"; echo "recipe_digest=$RECIPE_DIGEST"; } >> "$GITHUB_OUTPUT"
+
       - name: Cache toolchains (PlatformIO packages + uv)
+        if: github.ref != 'refs/heads/main' || steps.decide.outputs.skip != 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -69,6 +115,7 @@ jobs:
 
       - id: build
         name: Build firmware via tasmota/build.sh (the parity script)
+        if: github.ref != 'refs/heads/main' || steps.decide.outputs.skip != 'true'
         run: |
           set -euo pipefail
           tasmota/build.sh 2>&1 | tee build_log.txt
@@ -80,7 +127,9 @@ jobs:
           echo "upstream_tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Upsert mirrored-tag Release
-        if: success() && github.ref == 'refs/heads/main'
+        if: success() && github.ref == 'refs/heads/main' && steps.decide.outputs.skip != 'true'
+        env:
+          RECIPE_DIGEST: ${{ steps.decide.outputs.recipe_digest }}
         run: |
           set -euo pipefail
           TAG="${{ steps.build.outputs.upstream_tag }}"
@@ -92,6 +141,7 @@ jobs:
 
           - Pipeline run: @@RUN_URL@@ (this repo at `@@REPO_SHA@@`)
           - Images: `tasmota32-ZB-GW03-EN.bin` (OTA image, flashed over the air via Tasmota's upgrade flow) and `tasmota32-ZB-GW03-EN.factory.bin` (factory image, flashed over serial on first install)
+          - Recipe digest: @@RECIPE_DIGEST@@ (hash of `tasmota/**`; build runs skip when this digest is already the published one)
           - `sha256sum`:
           ```
           @@SHA256@@
@@ -103,6 +153,7 @@ jobs:
           NOTES="${NOTES//@@RUN_URL@@/$RUN_URL}"
           NOTES="${NOTES//@@REPO_SHA@@/$GITHUB_SHA}"
           NOTES="${NOTES//@@SHA256@@/$SHA256}"
+          NOTES="${NOTES//@@RECIPE_DIGEST@@/$RECIPE_DIGEST}"
 
           TITLE="ZB-GW03 $TAG (EN)"
           # --notes-file expects a path (or "-" for stdin): the notes content
@@ -121,10 +172,9 @@ jobs:
         if: success() && github.ref == 'refs/heads/main'
         run: |
           set -euo pipefail
-          TAG="${{ steps.build.outputs.upstream_tag }}"
           OPEN="$(gh issue list --label build-failure --state open --json number --jq 'map(.number) | join(" ")' || true)"
           for ISSUE_NO in $OPEN; do
-            gh issue close "$ISSUE_NO" --comment "Resolved: Pipeline run [$GITHUB_RUN_ID]($RUN_URL) built and published cleanly (Upstream release \`$TAG\`). Closing as superseded."
+            gh issue close "$ISSUE_NO" --comment "Resolved: Pipeline run [$GITHUB_RUN_ID]($RUN_URL) completed cleanly — the current (Upstream release, recipe) pair is published. Closing as superseded."
           done
 
       - name: Open or update the diagnostic issue
