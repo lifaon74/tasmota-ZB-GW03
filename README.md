@@ -51,7 +51,8 @@ The Override files and the recipe logic live under `tasmota/`. `main` is ruleset
 
 Domain vocabulary lives in [`GLOSSARY.md`](GLOSSARY.md).
 
-## Credits
+## Credits and license
 
 - Recipe adapted from [`xsp1989/ZB-GW03_firmware`](https://github.com/xsp1989/ZB-GW03_firmware) (its v14.5.0-era `tasmota/README.md` recipe, trimmed to the EN-only matrix).
-- Firmware originates from the official [`arendst/Tasmota`](https://github.com/arendst/Tasmota) releases; their license applies to the binaries.
+- License: everything written in this repository — the Override files, `tasmota/build.sh`, the Pipeline, this documentation — is MIT (see [`LICENSE`](LICENSE)).
+- The **firmware** is built from [Upstream](https://github.com/arendst/Tasmota) sources and therefore carries **GPL-3.0** (Upstream's `LICENSE.txt`), exactly like the official Tasmota binaries — the MIT license does not cover those binaries.
