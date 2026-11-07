@@ -105,13 +105,15 @@ jobs:
           NOTES="${NOTES//@@SHA256@@/$SHA256}"
 
           TITLE="ZB-GW03 $TAG (EN)"
+          # --notes-file expects a path (or "-" for stdin): the notes content
+          # is piped in on stdin, never handed as the flag's value (cf. #8).
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" build/*.bin --clobber
-            gh release edit "$TAG" --title "$TITLE" --notes-file "$NOTES"
+            printf '%s' "$NOTES" | gh release edit "$TAG" --title "$TITLE" --notes-file -
             echo "Release $TAG: binaries replaced (upsert)."
           else
-            gh release create "$TAG" build/*.bin --target "$GITHUB_SHA" \
-              --title "$TITLE" --notes-file "$NOTES"
+            printf '%s' "$NOTES" | gh release create "$TAG" build/*.bin --target "$GITHUB_SHA" \
+              --title "$TITLE" --notes-file -
             echo "Release $TAG: created, tag pointing at $GITHUB_SHA."
           fi
 
